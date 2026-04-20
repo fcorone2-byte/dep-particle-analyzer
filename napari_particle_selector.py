@@ -785,21 +785,34 @@ def main():
                 widget.on_auto_click(y, x)
             auto_points_layer.events.connect(_on_select_change)
 
+        # Keep track of how many seeds added
+        _n_seeds = [0]
+
         @manual_layer.events.data.connect
         def _on_manual_add(_event=None):
             if len(manual_layer.data) == 0:
                 return
+            # Only fire on a genuinely new point
+            if len(manual_layer.data) <= _n_seeds[0]:
+                return
+            _n_seeds[0] = len(manual_layer.data)
             pt = manual_layer.data[-1]
             y, x = float(pt[1]), float(pt[2])
             # Follow particle across all frames
             traj = follow_particle(y, x, centroids_per_frame, max_dist=20)
-            # Build points for all frames so dot persists when scrubbing
-            all_pts = np.array([[t[0], t[1], t[2]] for t in traj])
-            # Disconnect to avoid recursion, replace data, reconnect
-            manual_layer.events.data.disconnect(_on_manual_add)
-            prev = manual_layer.data[:-1] if len(manual_layer.data) > 1 else np.zeros((0,3))
-            manual_layer.data = np.vstack([prev, all_pts]) if len(prev) > 0 else all_pts
-            manual_layer.events.data.connect(_on_manual_add)
+            # Draw trajectory as a path on a separate shapes layer
+            path_pts = np.array([[t[1], t[2]] for t in traj])
+            if "manual_paths" not in [l.name for l in viewer.layers]:
+                viewer.add_shapes(
+                    [path_pts], shape_type="path",
+                    edge_color="lime", edge_width=2,
+                    name="manual_paths", opacity=0.8,
+                )
+            else:
+                paths_layer = viewer.layers["manual_paths"]
+                existing = list(paths_layer.data)
+                existing.append(path_pts)
+                paths_layer.data = existing
             widget.on_manual_add(y, x)
 
     napari.run()
