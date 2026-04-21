@@ -701,6 +701,122 @@ def main():
     else:
         print("No file selected — using default.")
 
+    if mode == "project":
+        # Load saved project file
+        from qtpy.QtWidgets import QFileDialog
+        proj_path, _ = QFileDialog.getOpenFileName(
+            None, "Open Project File",
+            str(Path.home() / "Downloads"),
+            "DEP Project Files (*.dep);;All Files (*)",
+        )
+        if not proj_path:
+            print("No project selected.")
+            return
+        project = json.loads(Path(proj_path).read_text())
+        input_path    = Path(project["input_path"])
+        fps           = project["fps"]
+        pixel_size_um = project["pixel_size_um"]
+        counts_per_frame = project["counts_per_frame"]
+        centroids_per_frame = [
+            [(y, x) for y, x in frame]
+            for frame in project["centroids_per_frame"]
+        ]
+        all_centroids = project.get("all_centroids", [])
+        manual_seeds  = [(y, x) for y, x in project.get("manual_seeds", [])]
+        manual_trajs  = [
+            [(t[0], t[1], t[2], t[3]) for t in traj]
+            for traj in project.get("manual_trajectories", [])
+        ]
+
+        print(f"Loading project: {proj_path}")
+        frames = load_video_frames(input_path)
+
+        viewer = napari.Viewer(title=f"Trap Counting — {input_path.name} [Project]")
+        viewer.add_image(frames, name="frames", rgb=True)
+
+        if all_centroids:
+            pt_data = np.asarray(all_centroids, dtype=float)
+            auto_points_layer = viewer.add_points(
+                pt_data, name="trapped_particles",
+                size=6, face_color="red", border_color="white", opacity=0.7,
+            )
+        else:
+            auto_points_layer = None
+
+        manual_layer = viewer.add_points(
+            np.zeros((0, 3), dtype=float),
+            name="manual_marks",
+            size=12, face_color="lime", border_color="white", opacity=0.9,
+            out_of_slice_display=True,
+        )
+
+        widget = TrapCountingWidget(
+            viewer=viewer, frames=frames,
+            counts_per_frame=counts_per_frame,
+            all_centroids=all_centroids,
+            centroids_per_frame=centroids_per_frame,
+            output_dir=args.output_dir,
+            input_path=input_path,
+            fps=fps, pixel_size_um=pixel_size_um,
+        )
+        widget.manual_layer  = manual_layer
+        widget.manual_seeds  = manual_seeds
+        widget.manual_trajectories = manual_trajs
+        widget.manual_label.setText(str(len(manual_seeds)))
+
+        # Restore manual trajectories as path shapes
+        if manual_trajs:
+            for traj in manual_trajs:
+                path_pts = np.array([[t[1], t[2]] for t in traj])
+                if "manual_paths" not in [l.name for l in viewer.layers]:
+                    viewer.add_shapes(
+                        [path_pts], shape_type="path",
+                        edge_color="lime", edge_width=2,
+                        name="manual_paths", opacity=0.8,
+                    )
+                else:
+                    paths_layer = viewer.layers["manual_paths"]
+                    existing = list(paths_layer.data)
+                    existing.append(path_pts)
+                    paths_layer.data = existing
+
+        viewer.window.add_dock_widget(widget, area="right", name="Trap Counting")
+
+        if auto_points_layer is not None:
+            def _on_select_change(event):
+                selected = list(auto_points_layer.selected_data)
+                if not selected:
+                    return
+                idx = min(selected)
+                pt = auto_points_layer.data[idx]
+                y, x = float(pt[1]), float(pt[2])
+                widget.on_auto_click(y, x)
+            auto_points_layer.events.connect(_on_select_change)
+
+        @manual_layer.events.data.connect
+        def _on_manual_add_proj(_event=None):
+            if len(manual_layer.data) == 0:
+                return
+            pt = manual_layer.data[-1]
+            y, x = float(pt[1]), float(pt[2])
+            traj = follow_particle(y, x, centroids_per_frame, max_dist=20)
+            path_pts = np.array([[t[1], t[2]] for t in traj])
+            if "manual_paths" not in [l.name for l in viewer.layers]:
+                viewer.add_shapes(
+                    [path_pts], shape_type="path",
+                    edge_color="lime", edge_width=2,
+                    name="manual_paths", opacity=0.8,
+                )
+            else:
+                paths_layer = viewer.layers["manual_paths"]
+                existing = list(paths_layer.data)
+                existing.append(path_pts)
+                paths_layer.data = existing
+            widget.on_manual_add(y, x)
+
+        napari.run()
+        return
+
     if mode == "tracking":
         frames, tracks, track_info, _schedule = run_tracking(
             input_path=args.input,
