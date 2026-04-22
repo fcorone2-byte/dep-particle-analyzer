@@ -23,10 +23,10 @@ jobs:
 
       - name: Build executable
         run: |
-          pyinstaller --onefile --windowed --name "ParticleAnalyzer" --exclude-module PyQt6 --hidden-import imageio --hidden-import imageio_ffmpeg --hidden-import av --hidden-import cv2 --hidden-import scipy --hidden-import napari --collect-all imageio --collect-all imageio_ffmpeg --collect-all napari napari_particle_selector.py
+          pyinstaller --onedir --windowed --name "ParticleAnalyzer" --exclude-module PyQt6 --hidden-import imageio --hidden-import imageio_ffmpeg --hidden-import av --hidden-import cv2 --hidden-import scipy --hidden-import napari --collect-all imageio --collect-all imageio_ffmpeg --collect-all napari napari_particle_selector.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ParticleAnalyzer-Windows
-          path: dist/ParticleAnalyzer.exe
+          path: dist/ParticleAnalyzer/
