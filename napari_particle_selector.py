@@ -11,7 +11,10 @@ import matplotlib.pyplot as plt
 import napari
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from qtpy.QtCore import Qt
 from qtpy.QtWidgets import (
+    QLineEdit,
+    QTextEdit,
     QButtonGroup,
     QDialog,
     QDialogButtonBox,
@@ -55,18 +58,29 @@ class ModeDialog(QDialog):
             "Trap Counting\n"
             "Post array · iDEP trapping · Count + select + manually mark particles"
         )
+        self.radio_sorting = QRadioButton(
+            "Outlet Sorting Analysis\n"
+            "Constriction sorter · Measure fractions in each outlet · Calculate Σ*"
+        )
         group = QButtonGroup(self)
         group.addButton(self.radio_tracking)
         group.addButton(self.radio_trapping)
+        group.addButton(self.radio_sorting)
         outer.addWidget(self.radio_tracking)
         outer.addWidget(self.radio_trapping)
+        outer.addWidget(self.radio_sorting)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         outer.addWidget(buttons)
 
     def get_mode(self):
-        return "tracking" if self.radio_tracking.isChecked() else "trapping"
+        if self.radio_tracking.isChecked():
+            return "tracking"
+        elif self.radio_sorting.isChecked():
+            return "sorting"
+        else:
+            return "trapping"
 
 
 def parse_args():
@@ -177,10 +191,113 @@ def detect_bright_particles(frame, percentile_threshold=98.5, min_area=3, max_ar
     return particle_centroids
 
 
+def load_cnn_detector():
+    """Load the trained CNN model if it exists."""
+    import torch
+    import torch.nn as nn
+    model_path = Path("/Users/freddycoronel/Documents/Playground/data/napari_outputs/particle_detector.pt")
+    if not model_path.exists():
+        return None
+
+    class ParticleCNN(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.features = nn.Sequential(
+                nn.Conv2d(1, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+                nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+                nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            )
+            self.classifier = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(64 * 4 * 4, 128), nn.ReLU(), nn.Dropout(0.5),
+                nn.Linear(128, 2),
+            )
+        def forward(self, x):
+            return self.classifier(self.features(x))
+
+    model = ParticleCNN()
+    model.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))
+    model.eval()
+    return model
+
+
+def detect_with_cnn(frame, model, patch_size=32, stride=8, threshold=0.7):
+    """Slide CNN across frame and find particle locations."""
+    import torch
+    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY) if frame.ndim == 3 else frame.copy()
+    H, W = gray.shape
+
+    # Mask black borders and post interiors
+    border_mask = np.ones((H, W), dtype=np.uint8)
+    col_means = gray.mean(axis=0)
+    border_mask[:, col_means < 20] = 0
+    _, dark_mask = cv2.threshold(gray, 60, 255, cv2.THRESH_BINARY_INV)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (30, 30))
+    post_interior = cv2.erode(dark_mask, kernel)
+    search_mask = border_mask & (~post_interior // 255).astype(np.uint8)
+
+    # Only scan bright regions to save time
+    bright_regions = gray > 130
+
+    particle_centroids = []
+    half = patch_size // 2
+    batch_coords, batch_patches = [], []
+
+    for y in range(half, H - half, stride):
+        for x in range(half, W - half, stride):
+            if not search_mask[y, x]:
+                continue
+            if not bright_regions[y-2:y+2, x-2:x+2].any():
+                continue
+            patch = gray[y-half:y+half, x-half:x+half]
+            if patch.shape == (patch_size, patch_size):
+                batch_coords.append((y, x))
+                batch_patches.append(patch)
+
+    if not batch_patches:
+        return []
+
+    # Run CNN in batches
+    patches_tensor = torch.tensor(
+        np.array(batch_patches), dtype=torch.float32
+    ).unsqueeze(1) / 255.0
+
+    with torch.no_grad():
+        batch_size = 64
+        all_probs = []
+        for i in range(0, len(patches_tensor), batch_size):
+            batch = patches_tensor[i:i+batch_size]
+            logits = model(batch)
+            probs = torch.softmax(logits, dim=1)[:, 1]
+            all_probs.extend(probs.tolist())
+
+    # Find peaks above threshold
+    score_map = np.zeros((H, W), dtype=float)
+    for (y, x), prob in zip(batch_coords, all_probs):
+        if prob > score_map[y, x]:
+            score_map[y, x] = prob
+
+    # Non-maximum suppression to get single points
+    from scipy.ndimage import maximum_filter
+    local_max = (score_map == maximum_filter(score_map, size=patch_size)) & (score_map > threshold)
+    ys, xs = np.where(local_max)
+    for y, x in zip(ys, xs):
+        particle_centroids.append((float(y), float(x)))
+
+    return particle_centroids
+
+
 def run_trap_counting(*, input_path, fps, pixel_size_um):
     frames = load_video_frames(input_path)
     if frames.size == 0:
         raise ValueError(f"No frames loaded from {input_path}")
+
+    # Use CNN detector if available, otherwise fall back to brightness threshold
+    cnn_model = load_cnn_detector()
+    if cnn_model is not None:
+        print("  Using trained AI detector (CNN)...")
+    else:
+        print("  Using brightness threshold detector (no trained model found)...")
 
     print("  Detecting particles across all frames...")
     counts_per_frame = []
@@ -188,7 +305,23 @@ def run_trap_counting(*, input_path, fps, pixel_size_um):
     centroids_per_frame = []
 
     for frame_idx, frame in enumerate(frames):
-        centroids = detect_bright_particles(frame)
+        # Always run brightness detector
+        threshold_centroids = detect_bright_particles(frame)
+        if cnn_model is not None:
+            # Also run CNN and merge results
+            cnn_centroids = detect_with_cnn(frame, cnn_model)
+            # Merge: add CNN detections that aren't already covered by threshold
+            merged = list(threshold_centroids)
+            for cy, cx in cnn_centroids:
+                too_close = any(
+                    np.sqrt((cy - ty)**2 + (cx - tx)**2) < 15
+                    for ty, tx in threshold_centroids
+                )
+                if not too_close:
+                    merged.append((cy, cx))
+            centroids = merged
+        else:
+            centroids = threshold_centroids
         counts_per_frame.append(len(centroids))
         centroids_per_frame.append(centroids)
         for (y, x) in centroids:
@@ -413,6 +546,95 @@ class TrackingWidget(QWidget):
                 f'Relaunch with:\npython3 napari_particle_selector.py --input "{selected}"')
 
 
+class AIChatWidget(QWidget):
+    def __init__(self, get_context_fn):
+        super().__init__()
+        self.get_context_fn = get_context_fn
+        outer = QVBoxLayout(self)
+
+        title = QLabel("AI Assistant")
+        title.setStyleSheet("font-weight: bold; font-size: 13px;")
+        outer.addWidget(title)
+
+        self.chat_display = QTextEdit()
+        self.chat_display.setReadOnly(True)
+        self.chat_display.setStyleSheet(
+            "background: #1a1a2e; color: #e0e0e0; padding: 8px; "
+            "border-radius: 4px; font-size: 11px;"
+        )
+        self.chat_display.setMinimumHeight(300)
+        self.chat_display.setPlainText("Ask me anything about your experiment.")
+        outer.addWidget(self.chat_display)
+
+        input_row = QHBoxLayout()
+        self.input_box = QLineEdit()
+        self.input_box.setPlaceholderText("Ask a question...")
+        self.input_box.returnPressed.connect(self.send_message)
+        input_row.addWidget(self.input_box)
+
+        send_btn = QPushButton("Ask")
+        send_btn.clicked.connect(self.send_message)
+        input_row.addWidget(send_btn)
+        outer.addLayout(input_row)
+
+        self.history = []
+
+    def send_message(self):
+        question = self.input_box.text().strip()
+        if not question:
+            return
+        self.input_box.clear()
+        self.chat_display.setText("Thinking...")
+
+        context = self.get_context_fn()
+        system_prompt = f"""You are an expert AI assistant for DEP (dielectrophoresis) microfluidic experiments.
+You have access to the current experiment data:
+{context}
+
+Answer questions about the experiment, explain what the data means scientifically, 
+guide the user on which particles to mark, and help interpret results.
+Keep answers concise and scientific. If asked to summarize, write 2-3 sentences 
+suitable for a methods/results section of a paper."""
+
+        import subprocess, json
+        self.history.append({"role": "user", "content": question})
+        messages = [{"role": "system", "content": system_prompt}] + self.history
+
+        try:
+            import urllib.request
+            payload = json.dumps({
+                "model": "mistral",
+                "messages": messages,
+                "stream": False
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                "http://localhost:11434/api/chat",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                response_text = json.loads(resp.read())["message"]["content"]
+        except Exception as e:
+            response_text = f"Error: {e}. Make sure Ollama is running (run: ollama serve)"
+
+        self.history.append({"role": "assistant", "content": response_text})
+
+        # Show last 3 exchanges
+        display = ""
+        for msg in self.history[-6:]:
+            role = "You" if msg["role"] == "user" else "AI"
+            display += f"[{role}]: {msg['content']}\n\n"
+        self.chat_display.setPlainText(display.strip())
+        self.chat_display.verticalScrollBar().setValue(
+            self.chat_display.verticalScrollBar().maximum()
+        )
+
+    def clear_history(self):
+        self.history = []
+        self.chat_display.setPlainText("Ask me anything about your experiment.")
+
+
 class TrapCountingWidget(QWidget):
     def __init__(self, *, viewer, frames, counts_per_frame,
                  all_centroids, centroids_per_frame,
@@ -597,6 +819,31 @@ class TrapCountingWidget(QWidget):
         if hasattr(self, "_selected_speeds"):
             self._selected_speeds = []
 
+    def retrain_detector(self):
+        import subprocess, threading
+        patches_dir = self.output_dir / "training_data" / "particles"
+        n_patches = len(list(patches_dir.glob("*.png"))) if patches_dir.exists() else 0
+        if n_patches < 20:
+            QMessageBox.warning(self, "Not enough data",
+                f"Only {n_patches} training patches found. Mark at least 20 particles first.")
+            return
+        self.retrain_status.setText(f"Training on {n_patches} patches... please wait")
+
+        def run_training():
+            script = Path("/Users/freddycoronel/Documents/Playground/train_particle_detector.py")
+            result = subprocess.run(
+                ["python", str(script)],
+                capture_output=True, text=True
+            )
+            # Find best accuracy from output
+            acc = "unknown"
+            for line in result.stdout.splitlines():
+                if "Best validation accuracy" in line:
+                    acc = line.split(":")[-1].strip()
+            self.retrain_status.setText(f"Training complete! Accuracy: {acc}. Restart app to use new model.")
+
+        threading.Thread(target=run_training, daemon=True).start()
+
     def on_auto_click(self, y, x):
         self.show_selected_particle(y, x, label="auto")
 
@@ -674,6 +921,174 @@ class TrapCountingWidget(QWidget):
                 f'Relaunch with:\npython3 napari_particle_selector.py --input "{selected}"')
 
 
+class OutletSortingWidget(QWidget):
+    def __init__(self, *, viewer, frames, input_path, output_dir, fps, pixel_size_um):
+        super().__init__()
+        self.viewer        = viewer
+        self.frames        = frames
+        self.input_path    = input_path
+        self.output_dir    = output_dir
+        self.fps           = fps
+        self.pixel_size_um = pixel_size_um
+        self.roi_centers   = {}
+        self.intensities   = {}
+        self.outlet_names  = ["S1_top", "S2_top", "C", "S2_bottom", "S1_bottom"]
+
+        outer = QVBoxLayout(self)
+        title = QLabel("Mode: Outlet Sorting")
+        title.setStyleSheet("font-weight: bold;")
+        outer.addWidget(title)
+
+        import re
+        fname = input_path.stem
+        v_match = re.search(r'd(\d+)V', fname)
+        f_match = re.search(r'(\d+[Kk]?[Hh]z)', fname)
+        self.voltage   = v_match.group(1) + "V" if v_match else "unknown"
+        self.frequency = f_match.group(1)         if f_match else "unknown"
+
+        form = QFormLayout()
+        self.voltage_label = QLabel(self.voltage)
+        self.freq_label    = QLabel(self.frequency)
+        self.status_label  = QLabel("Mark 5 outlets then click Analyze")
+        self.sigma_label   = QLabel("-")
+        self.s1_label      = QLabel("-")
+        self.s2_label      = QLabel("-")
+        self.c_label       = QLabel("-")
+        form.addRow("Voltage",     self.voltage_label)
+        form.addRow("Frequency",   self.freq_label)
+        form.addRow("Status",      self.status_label)
+        form.addRow("Σ*",          self.sigma_label)
+        form.addRow("S1 fraction", self.s1_label)
+        form.addRow("S2 fraction", self.s2_label)
+        form.addRow("C fraction",  self.c_label)
+        outer.addLayout(form)
+
+        info = QLabel(
+            "To mark outlets:\n"
+            "1. Click roi_clicks in layer list\n"
+            "2. Press 2 (Add Points mode)\n"
+            "3. Click in this order:\n"
+            "   S1_top, S2_top, C, S2_bottom, S1_bottom\n"
+            "4. Press 3 to exit\n"
+            "5. Click Analyze Outlets"
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("font-size: 11px; color: gray;")
+        outer.addWidget(info)
+
+        self.figure, (self.ax_avg, self.ax_bar) = plt.subplots(1, 2, figsize=(6, 3))
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        outer.addWidget(self.canvas)
+
+        buttons = QHBoxLayout()
+        analyze_btn = QPushButton("Analyze Outlets")
+        analyze_btn.clicked.connect(self.analyze)
+        save_btn = QPushButton("Save Results")
+        save_btn.clicked.connect(self.save_results)
+        buttons.addWidget(analyze_btn)
+        buttons.addWidget(save_btn)
+        outer.addLayout(buttons)
+
+        avg = np.mean(self.frames, axis=0).astype(np.uint8)
+        self.gray_avg = cv2.cvtColor(avg, cv2.COLOR_RGB2GRAY) if avg.ndim == 3 else avg
+        self.ax_avg.imshow(self.gray_avg, cmap="gray")
+        self.ax_avg.set_title("Time-averaged")
+        self.ax_avg.axis("off")
+        self.ax_bar.text(0.5, 0.5, "Click outlets\nthen Analyze",
+                         ha="center", va="center", transform=self.ax_bar.transAxes)
+        self.ax_bar.axis("off")
+        self.figure.tight_layout()
+        self.canvas.draw_idle()
+
+    def on_roi_click(self, layer):
+        n = len(layer.data)
+        if n == 0:
+            return
+        if n <= len(self.outlet_names):
+            name = self.outlet_names[n - 1]
+            pt   = layer.data[-1]
+            y, x = float(pt[1]), float(pt[2])
+            self.roi_centers[name] = (int(y), int(x))
+            next_str = f"Next: {self.outlet_names[n]}" if n < 5 else "All done — click Analyze"
+            self.status_label.setText(f"Marked {n}/5: {name}. {next_str}")
+
+    def analyze(self):
+        if len(self.roi_centers) < 5:
+            QMessageBox.warning(self, "Not ready",
+                f"Only {len(self.roi_centers)}/5 outlets marked.")
+            return
+
+        roi_radius = 10
+        H, W = self.gray_avg.shape
+        raw = {}
+
+        self.ax_avg.clear()
+        self.ax_avg.imshow(self.gray_avg, cmap="gray")
+        self.ax_avg.set_title("Time-averaged with ROIs")
+        self.ax_avg.axis("off")
+
+        for name in self.outlet_names:
+            cy, cx = self.roi_centers[name]
+            y0, y1 = max(0, cy-roi_radius), min(H, cy+roi_radius)
+            x0, x1 = max(0, cx-roi_radius), min(W, cx+roi_radius)
+            raw[name] = float(self.gray_avg[y0:y1, x0:x1].mean())
+            circle = plt.Circle((cx, cy), roi_radius,
+                                 color="yellow", fill=False, linewidth=1.5)
+            self.ax_avg.add_patch(circle)
+            self.ax_avg.text(cx+roi_radius+2, cy,
+                             f"{name}\n{raw[name]:.0f}",
+                             color="yellow", fontsize=7, va="center")
+
+        bg   = min(raw.values())
+        corr = {k: max(0.0, v - bg) for k, v in raw.items()}
+        self.intensities = corr
+
+        I_S1  = (corr["S1_top"] + corr["S1_bottom"]) / 2
+        I_S2  = (corr["S2_top"] + corr["S2_bottom"]) / 2
+        I_C   = corr["C"]
+        total = I_S1*2 + I_S2*2 + I_C if (I_S1*2 + I_S2*2 + I_C) > 0 else 1
+
+        frac_S1 = I_S1*2 / total
+        frac_S2 = I_S2*2 / total
+        frac_C  = I_C   / total
+        sigma   = (I_S1 - I_C) / (I_S1 + I_C) if (I_S1 + I_C) > 0 else 0
+
+        direction = "S1/S2 (+DEP)" if sigma > 0.05 else "C (-DEP)" if sigma < -0.05 else "No sorting"
+        self.sigma_label.setText(f"{sigma:.3f}  ({direction})")
+        self.s1_label.setText(f"{frac_S1*100:.1f}%")
+        self.s2_label.setText(f"{frac_S2*100:.1f}%")
+        self.c_label.setText(f"{frac_C*100:.1f}%")
+
+        self.ax_bar.clear()
+        self.ax_bar.bar([0], [frac_S1], color="#e63946", label="S1 outer")
+        self.ax_bar.bar([0], [frac_S2], bottom=[frac_S1], color="#f4a261", label="S2 inner")
+        self.ax_bar.bar([0], [frac_C],  bottom=[frac_S1+frac_S2], color="#4a9eff", label="C center")
+        self.ax_bar.set_ylim(0, 1)
+        self.ax_bar.set_ylabel("Fraction")
+        self.ax_bar.set_xticks([0])
+        self.ax_bar.set_xticklabels([f"{self.voltage}\n{self.frequency}"], fontsize=8)
+        self.ax_bar.set_title(f"Σ* = {sigma:.3f}", fontsize=9)
+        self.ax_bar.legend(fontsize=7)
+        self.ax_bar.set_axis_on()
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+    def save_results(self):
+        if not self.intensities:
+            QMessageBox.information(self, "Nothing to save", "Run Analyze first.")
+            return
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        prefix = self.output_dir / f"{self.input_path.stem}_sorting"
+        rows = [["outlet","bg_corrected_intensity"]]
+        for name in self.outlet_names:
+            rows.append([name, f"{self.intensities[name]:.2f}"])
+        import csv
+        with open(str(prefix)+"_results.csv","w",newline="") as f:
+            csv.writer(f).writerows(rows)
+        self.figure.savefig(str(prefix)+"_plot.png", dpi=150, bbox_inches="tight")
+        QMessageBox.information(self, "Saved", f"Saved to:\n{self.output_dir}")
+
+
 def main():
     args = parse_args()
     from qtpy.QtWidgets import QApplication
@@ -687,19 +1102,37 @@ def main():
     mode = dialog.get_mode()
     print(f"Mode selected: {mode}")
 
-    # Ask user to pick a file
-    from qtpy.QtWidgets import QFileDialog
-    file_path, _ = QFileDialog.getOpenFileName(
-        None,
-        "Select video file to analyze",
-        str(Path.home() / "Downloads"),
-        "Supported Files (*.gif *.mp4 *.avi *.mov *.tif *.tiff);;All Files (*)",
-    )
-    if file_path:
-        args.input = Path(file_path)
-        print(f"File selected: {args.input}")
+    # Ask user whether they want a video file or PNG folder
+    from qtpy.QtWidgets import QFileDialog, QMessageBox
+    choice = QMessageBox()
+    choice.setWindowTitle("Select input type")
+    choice.setText("What are you loading?")
+    btn_file   = choice.addButton("Video file (.avi/.gif/.mp4)", QMessageBox.AcceptRole)
+    btn_folder = choice.addButton("PNG image folder", QMessageBox.AcceptRole)
+    choice.addButton("Cancel", QMessageBox.RejectRole)
+    choice.exec_()
+
+    clicked = choice.clickedButton()
+    if clicked == btn_file:
+        file_path, _ = QFileDialog.getOpenFileName(
+            None, "Select video file",
+            str(Path.home() / "Downloads"),
+            "Supported Files (*.gif *.mp4 *.avi *.mov *.tif *.tiff);;All Files (*)",
+        )
+        if file_path:
+            args.input = Path(file_path)
+            print(f"File selected: {args.input}")
+    elif clicked == btn_folder:
+        folder_path = QFileDialog.getExistingDirectory(
+            None, "Select folder of PNG images",
+            str(Path.home() / "Downloads"),
+        )
+        if folder_path:
+            args.input = Path(folder_path)
+            print(f"Folder selected: {args.input}")
     else:
-        print("No file selected — using default.")
+        print("Cancelled.")
+        return
 
     if mode == "project":
         # Load saved project file
@@ -739,6 +1172,7 @@ def main():
             auto_points_layer = viewer.add_points(
                 pt_data, name="trapped_particles",
                 size=6, face_color="red", border_color="white", opacity=0.7,
+                out_of_slice_display=True,
             )
         else:
             auto_points_layer = None
@@ -782,6 +1216,28 @@ def main():
 
         viewer.window.add_dock_widget(widget, area="right", name="Trap Counting")
 
+        # Add AI chatbox
+        def get_context():
+            lines = [
+                f"Video: {args.input.name}",
+                f"Frames analyzed: {len(counts_per_frame)}",
+                f"Mean particles/frame: {np.mean(counts_per_frame):.1f}",
+                f"Peak count: {max(counts_per_frame)} at t={np.argmax(counts_per_frame)/args.fps:.1f}s",
+                f"Total detections: {sum(counts_per_frame)}",
+            ]
+            if hasattr(widget, 'flow_label'):
+                lines.append(f"Mean flow speed: {widget.flow_label.text()}")
+                lines.append(f"Flow half-1 (vx): {widget.flow_h1_label.text()}")
+                lines.append(f"Flow half-2 (vx): {widget.flow_h2_label.text()}")
+            if widget.selected_label.text() != "None":
+                lines.append(f"Selected particle: {widget.selected_label.text()}")
+            if widget.manual_seeds:
+                lines.append(f"Manually marked particles: {len(widget.manual_seeds)}")
+            return "\n".join(lines)
+
+        chat_widget = AIChatWidget(get_context_fn=get_context)
+        viewer.window.add_dock_widget(chat_widget, area="right", name="AI Assistant")
+
         if auto_points_layer is not None:
             def _on_select_change(event):
                 selected = list(auto_points_layer.selected_data)
@@ -813,6 +1269,32 @@ def main():
                 existing.append(path_pts)
                 paths_layer.data = existing
             widget.on_manual_add(y, x)
+
+        napari.run()
+        return
+
+    if mode == "sorting":
+        print("Loading video for outlet sorting...")
+        frames = load_video_frames(args.input)
+        viewer = napari.Viewer(title=f"Outlet Sorting — {args.input.name}")
+        avg = np.mean(frames, axis=0).astype(np.uint8)
+        viewer.add_image(frames, name="frames", rgb=True)
+        viewer.add_image(avg, name="time_average", rgb=True, opacity=0.5)
+        roi_layer = viewer.add_points(
+            np.zeros((0, 3), dtype=float),
+            name="roi_clicks",
+            size=10, face_color="yellow", border_color="red", opacity=0.9,
+        )
+        widget = OutletSortingWidget(
+            viewer=viewer, frames=frames,
+            input_path=args.input, output_dir=args.output_dir,
+            fps=args.fps, pixel_size_um=args.pixel_size_um,
+        )
+        viewer.window.add_dock_widget(widget, area="right", name="Outlet Sorting")
+
+        @roi_layer.events.data.connect
+        def _on_roi(_event=None):
+            widget.on_roi_click(roi_layer)
 
         napari.run()
         return
@@ -870,6 +1352,7 @@ def main():
             auto_points_layer = viewer.add_points(
                 pt_data, name="trapped_particles",
                 size=6, face_color="red", border_color="white", opacity=0.7,
+                out_of_slice_display=True,
             )
 
         manual_layer = viewer.add_points(
@@ -889,6 +1372,28 @@ def main():
         )
         widget.manual_layer = manual_layer
         viewer.window.add_dock_widget(widget, area="right", name="Trap Counting")
+
+        # Add AI chatbox
+        def get_context():
+            lines = [
+                f"Video: {args.input.name}",
+                f"Frames analyzed: {len(counts_per_frame)}",
+                f"Mean particles/frame: {np.mean(counts_per_frame):.1f}",
+                f"Peak count: {max(counts_per_frame)} at t={np.argmax(counts_per_frame)/args.fps:.1f}s",
+                f"Total detections: {sum(counts_per_frame)}",
+            ]
+            if hasattr(widget, 'flow_label'):
+                lines.append(f"Mean flow speed: {widget.flow_label.text()}")
+                lines.append(f"Flow half-1 (vx): {widget.flow_h1_label.text()}")
+                lines.append(f"Flow half-2 (vx): {widget.flow_h2_label.text()}")
+            if widget.selected_label.text() != "None":
+                lines.append(f"Selected particle: {widget.selected_label.text()}")
+            if widget.manual_seeds:
+                lines.append(f"Manually marked particles: {len(widget.manual_seeds)}")
+            return "\n".join(lines)
+
+        chat_widget = AIChatWidget(get_context_fn=get_context)
+        viewer.window.add_dock_widget(chat_widget, area="right", name="AI Assistant")
 
         if auto_points_layer is not None:
             def _on_select_change(event):
@@ -914,21 +1419,19 @@ def main():
             _n_seeds[0] = len(manual_layer.data)
             pt = manual_layer.data[-1]
             y, x = float(pt[1]), float(pt[2])
-            # Follow particle across all frames
-            traj = follow_particle(y, x, centroids_per_frame, max_dist=20)
-            # Draw trajectory as a path on a separate shapes layer
-            path_pts = np.array([[t[1], t[2]] for t in traj])
-            if "manual_paths" not in [l.name for l in viewer.layers]:
-                viewer.add_shapes(
-                    [path_pts], shape_type="path",
-                    edge_color="lime", edge_width=2,
-                    name="manual_paths", opacity=0.8,
-                )
-            else:
-                paths_layer = viewer.layers["manual_paths"]
-                existing = list(paths_layer.data)
-                existing.append(path_pts)
-                paths_layer.data = existing
+            print(f"  Marked particle at ({int(x)}, {int(y)})")
+            # Add this point at every frame so it persists when scrubbing
+            all_frame_pts = np.array([[f, y, x] for f in range(len(frames))])
+            manual_layer.events.data.disconnect(_on_manual_add)
+            existing = manual_layer.data[:-1] if len(manual_layer.data) > 1 else np.zeros((0,3))
+            manual_layer.data = np.vstack([existing, all_frame_pts]) if len(existing) > 0 else all_frame_pts
+            _n_seeds[0] = len(manual_layer.data)
+            manual_layer.events.data.connect(_on_manual_add)
+            manual_layer.opacity = 0.9
+            manual_layer.refresh()
+            print(f"  Green dot added at all frames, total points: {len(manual_layer.data)}")
+            # Save training patch at clicked location
+            widget._save_training_patch(y, x)
             widget.on_manual_add(y, x)
 
     napari.run()
