@@ -18,12 +18,12 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install napari[all] opencv-python matplotlib scipy pyinstaller imageio imageio-ffmpeg av PyQt5
+          pip install napari[all] opencv-python matplotlib scipy pyinstaller imageio imageio-ffmpeg av PyQt5 torch torchvision
           pip uninstall PyQt6 PyQt6-Qt6 PyQt6-sip -y || true
 
       - name: Build executable
         run: |
-          pyinstaller --onedir --windowed --name "ParticleAnalyzer" --exclude-module PyQt6 --hidden-import imageio --hidden-import imageio_ffmpeg --hidden-import av --hidden-import cv2 --hidden-import scipy --hidden-import napari --collect-all imageio --collect-all imageio_ffmpeg --collect-all napari --collect-all vispy --collect-all skimage napari_particle_selector.py
+          pyinstaller --onedir --windowed --name "ParticleAnalyzer" --exclude-module PyQt6 --hidden-import imageio --hidden-import imageio_ffmpeg --hidden-import av --hidden-import cv2 --hidden-import scipy --hidden-import napari --hidden-import torch --collect-all imageio --collect-all imageio_ffmpeg --collect-all napari --collect-all vispy --collect-all skimage --collect-all torch napari_particle_selector.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
